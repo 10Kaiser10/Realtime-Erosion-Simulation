@@ -1,0 +1,202 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel rainFall
+#pragma kernel fluxCompute
+#pragma kernel depthVelocity
+#pragma kernel eroDep
+#pragma kernel sedimentTransport
+#pragma kernel evaporation
+#pragma kernel thermalFlow
+#pragma kernel thermalDep
+
+int sizeX;
+int sizeY;
+float rainRate;
+float dt;
+float A;
+float g;
+float l;
+float lx;
+float ly;
+float minSin;
+float Kc;
+float Ks;
+float Kd;
+float Ke;
+
+RWStructuredBuffer<float3> heights;
+RWStructuredBuffer<float4> flow;
+RWStructuredBuffer<float4> flowTher;
+RWStructuredBuffer<float2> speeds;
+
+[numthreads(32,1,1)]
+void rainFall (uint3 id : SV_DispatchThreadID)
+{
+    heights[id.x].y += dt * rainRate;
+}
+
+[numthreads(32, 1, 1)]
+void fluxCompute(uint3 id : SV_DispatchThreadID)
+{
+    float4 deltaH;
+    
+    deltaH.x = (id.x % sizeY > 0) ? (heights[id.x].x + heights[id.x].y - heights[id.x - 1].x - heights[id.x - 1].y) : 0;
+    deltaH.y = (id.x % sizeY < sizeY - 1) ? (heights[id.x].x + heights[id.x].y - heights[id.x + 1].x - heights[id.x + 1].y) : 0;
+    deltaH.z = (id.x / sizeY > 0) ? (heights[id.x].x + heights[id.x].y - heights[id.x - sizeY].x - heights[id.x - sizeY].y) : 0;
+    deltaH.w = (id.x / sizeY < sizeX - 1) ? (heights[id.x].x + heights[id.x].y - heights[id.x + sizeY].x - heights[id.x + sizeY].y) : 0;
+    
+    flow[id.x].x = max(0, flow[id.x].x + dt * A * g * deltaH.x / l);
+    flow[id.x].y = max(0, flow[id.x].y + dt * A * g * deltaH.y / l);
+    flow[id.x].z = max(0, flow[id.x].z + dt * A * g * deltaH.z / l);
+    flow[id.x].w = max(0, flow[id.x].w + dt * A * g * deltaH.w / l);
+    
+    float K = min(1, (heights[id.x].y * lx * ly / dt) / (flow[id.x].x + flow[id.x].y + flow[id.x].z + flow[id.x].w));
+
+    flow[id.x].x *= K;
+    flow[id.x].y *= K;
+    flow[id.x].z *= K;
+    flow[id.x].w *= K;
+}
+
+[numthreads(32, 1, 1)]
+void depthVelocity(uint3 id : SV_DispatchThreadID)
+{
+    float d1 = heights[id.x].y;
+    
+    float flowOut = flow[id.x].x + flow[id.x].y + flow[id.x].z + flow[id.x].w;
+    
+    float flowIn = (id.x % sizeY > 0) ? (flow[id.x - 1].y) : 0;
+    flowIn += (id.x % sizeY < sizeY - 1) ? (flow[id.x + 1].x) : 0;
+    flowIn += (id.x / sizeY > 0) ? (flow[id.x - sizeY].w) : 0;
+    flowIn += (id.x / sizeY < sizeX - 1) ? (flow[id.x + sizeY].z) : 0;
+
+    heights[id.x].y += dt * (flowIn - flowOut) / (lx * ly);
+    
+    float d2 = heights[id.x].y;
+
+    float deltaWx = 0;
+    deltaWx += flow[id.x].w - flow[id.x].z;
+    deltaWx += (id.x / sizeY > 0) ? (flow[id.x - sizeY].w) : 0;
+    deltaWx -= (id.x / sizeY < sizeX - 1) ? (flow[id.x + sizeY].z) : 0;
+
+    float deltaWy = 0;
+    deltaWy += flow[id.x].y - flow[id.x].x;
+    deltaWy += (id.x % sizeY > 0) ? (flow[id.x - 1].y) : 0;
+    deltaWy -= (id.x % sizeY < sizeY - 1) ? (flow[id.x + 1].x) : 0;
+    
+    speeds[id.x].x = deltaWx / (ly * (d1 + d2));
+    speeds[id.x].y = deltaWy / (lx * (d1 + d2));
+}
+
+[numthreads(32, 1, 1)]
+void eroDep(uint3 id : SV_DispatchThreadID)
+{
+    float hl, hr, hu, hd;
+    hl = (id.x % sizeY > 0) ? heights[id.x - 1].x : heights[id.x].x;
+    hr = (id.x % sizeY < sizeY - 1) ? heights[id.x + 1].x : heights[id.x].x;
+    hu = (id.x / sizeY > 0) ? heights[id.x - sizeY].x : heights[id.x].x;
+    hd = (id.x / sizeY < sizeX - 1) ? heights[id.x + sizeY].x : heights[id.x].x;
+
+    float dHx = (hd - hu) / (2 * lx);
+    float dHy = (hr - hl) / (2 * ly);
+    
+    float sinAlpha = sqrt(dHx * dHx + dHy * dHy) / sqrt(1 + dHx * dHx + dHy * dHy);
+    float capa = Kc * max(minSin, sinAlpha) * sqrt(speeds[id.x].x * speeds[id.x].x + speeds[id.x].y * speeds[id.x].y); // * max(0, (1 - heights[id.x].y));
+
+    if(heights[id.x].z < capa)
+    {
+        heights[id.x].x -= Ks * (capa - heights[id.x].z);
+        heights[id.x].z += Ks * (capa - heights[id.x].z);
+        //heights[id.x].y += Ks * (capa - heights[id.x].z);
+    }
+    else
+    {
+        heights[id.x].x += Kd * (heights[id.x].z - capa);
+        heights[id.x].z -= Kd * (heights[id.x].z - capa);
+        //heights[id.x].y -= Kd * (heights[id.x].z - capa);
+    }
+}
+
+bool checkInside(float2 id)
+{
+    return (id.x >= 0) && (id.x < sizeX) && (id.y >= 0) && (id.y < sizeY);
+}
+
+[numthreads(32, 1, 1)]
+void sedimentTransport(uint3 id : SV_DispatchThreadID)
+{
+    float2 lastPos;
+    lastPos.x = (id.x / sizeY) - dt * speeds[id.x].x;
+    lastPos.y = (id.x % sizeY) - dt * speeds[id.x].y;
+    
+    int2 ul, ur, bl, br;
+    ul.x = (int) lastPos.x, ul.y = (int) lastPos.y;
+    ur.x = ul.x, ur.y = ul.y + 1;
+    bl.x = ul.x + 1, bl.y = ul.y;
+    br.x = ul.x + 1, br.y = ul.y + 1;
+    
+    ul.x = clamp(ul.x, 1, sizeX-1), ul.y = clamp(ul.y, 1, sizeY-1);
+    ur.x = clamp(ur.x, 1, sizeX-1), ur.y = clamp(ur.y, 1, sizeY-1);
+    bl.x = clamp(bl.x, 1, sizeX-1), bl.y = clamp(bl.y, 1, sizeY-1);
+    br.x = clamp(br.x, 1, sizeX-1), br.y = clamp(br.y, 1, sizeY-1);
+    
+    float hul, hur, hbl, hbr;
+    /*hul = checkInside(ul) ? heights[ul.x * sizeY + ul.y].z : 0;
+    hur = checkInside(ur) ? heights[ur.x * sizeY + ur.y].z : 0;
+    hbl = checkInside(bl) ? heights[bl.x * sizeY + bl.y].z : 0;
+    hbr = checkInside(br) ? heights[br.x * sizeY + br.y].z : 0;*/
+    
+    hul = heights[ul.x * sizeY + ul.y].z;
+    hur = heights[ur.x * sizeY + ur.y].z;
+    hbl = heights[bl.x * sizeY + bl.y].z;
+    hbr = heights[br.x * sizeY + br.y].z;
+    
+    
+    float u = lastPos.x - ul.x, v = lastPos.y - ul.y;
+    
+    heights[id.x].z = hul * (1 - u) * (1 - v) + hur * (1 - u) * (v) + hbl * (u) * (1 - v) + hbr * (u) * (v);
+}
+
+[numthreads(32, 1, 1)]
+void evaporation(uint3 id : SV_DispatchThreadID)
+{
+    heights[id.x].y *= (1 - Ke * dt);
+}
+
+[numthreads(32, 1, 1)]
+void thermalFlow(uint3 id : SV_DispatchThreadID)
+{
+    float hl, hr, hu, hd, h;
+    hl = (id.x % sizeY > 0) ? heights[id.x - 1].x : heights[id.x].x;
+    hr = (id.x % sizeY < sizeY - 1) ? heights[id.x + 1].x : heights[id.x].x;
+    hu = (id.x / sizeY > 0) ? heights[id.x - sizeY].x : heights[id.x].x;
+    hd = (id.x / sizeY < sizeX - 1) ? heights[id.x + sizeY].x : heights[id.x].x;
+    h = heights[id.x].x;
+    
+    float avail = max(0, h - min(min(hu, hd), min(hl, hr))) * dt * 10 / 2;
+    float totH = 0;
+        
+    float talus = 1;
+    
+    totH += ((h > hl) && (((h - hl) / 1) > talus)) ? h - hl : 0;
+    totH += ((h > hr) && (((h - hr) / 1) > talus)) ? h - hr : 0;
+    totH += ((h > hu) && (((h - hu) / 1) > talus)) ? h - hu : 0;
+    totH += ((h > hd) && (((h - hd) / 1) > talus)) ? h - hd : 0;
+
+    flowTher[id.x].x = ((h > hl) && (((h - hl) / 1) > talus) && totH > 0) ? ((h - hl) / totH) * avail : 0;
+    flowTher[id.x].y = ((h > hr) && (((h - hr) / 1) > talus) && totH > 0) ? ((h - hr) / totH) * avail : 0;
+    flowTher[id.x].z = ((h > hu) && (((h - hu) / 1) > talus) && totH > 0) ? ((h - hu) / totH) * avail : 0;
+    flowTher[id.x].w = ((h > hd) && (((h - hd) / 1) > talus) && totH > 0) ? ((h - hd) / totH) * avail : 0;
+}
+
+[numthreads(32, 1, 1)]
+void thermalDep(uint3 id : SV_DispatchThreadID)
+{
+    float flowOut = flowTher[id.x].x + flowTher[id.x].y + flowTher[id.x].z + flowTher[id.x].w;
+    
+    float flowIn = (id.x % sizeY > 0) ? (flowTher[id.x - 1].y) : 0;
+    flowIn += (id.x % sizeY < sizeY - 1) ? (flowTher[id.x + 1].x) : 0;
+    flowIn += (id.x / sizeY > 0) ? (flowTher[id.x - sizeY].w) : 0;
+    flowIn += (id.x / sizeY < sizeX - 1) ? (flowTher[id.x + sizeY].z) : 0;
+    
+    heights[id.x].x += flowIn - flowOut;
+}
